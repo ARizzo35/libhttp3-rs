@@ -1,0 +1,33 @@
+[package]
+name = "libhttp3"
+version = "0.1.0"
+edition = "2024"
+description = "A Rust library for HTTP/3 clients and servers."
+readme = "README.md"
+homepage = "https://github.com/ARizzo35/libhttp3-rs"
+repository = "https://github.com/ARizzo35/libhttp3-rs"
+license = "MIT"
+license-file = "LICENSE"
+keywords = ["http", "http3"]
+categories = [
+  "network-programming",
+  "web-programming::http-client",
+  "web-programming::http-server"
+]
+
+[dependencies]
+anyhow = "1.0"
+axum = "0.8"
+bytes = "1"
+h3 = "0.0"
+h3-axum = "0"
+h3-quinn = "0.0"
+http = "1"
+quinn = "0.11"
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
+rustls-pemfile = "2"
+tokio = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
