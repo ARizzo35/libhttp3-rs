@@ -1,13 +1,12 @@
 [package]
 name = "libhttp3"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A Rust library for HTTP/3 clients and servers."
 readme = "README.md"
 homepage = "https://github.com/ARizzo35/libhttp3-rs"
 repository = "https://github.com/ARizzo35/libhttp3-rs"
 license = "MIT"
-license-file = "LICENSE"
 keywords = ["http", "http3"]
 categories = [
   "network-programming",
