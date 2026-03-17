@@ -7,7 +7,6 @@ readme = "README.md"
 homepage = "https://github.com/ARizzo35/libhttp3-rs"
 repository = "https://github.com/ARizzo35/libhttp3-rs"
 license = "MIT"
-license-file = "LICENSE"
 keywords = ["http", "http3"]
 categories = [
   "network-programming",
