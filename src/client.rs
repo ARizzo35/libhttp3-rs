@@ -353,6 +353,12 @@ impl SseStream {
             None => Ok(None),
         }
     }
+
+    /// Converts this stream into length-prefixed binary framing.
+    /// Must be called before any `next` reads. Bytes already buffered are discarded.
+    pub fn into_binary_stream(self) -> BinaryStream {
+        BinaryStream::new(self.request_stream)
+    }
 }
 
 /// Maximum allowed frame payload size (16 MiB).
