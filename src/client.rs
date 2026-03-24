@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use bytes::{Buf, Bytes};
 use h3_quinn::quinn::{ClientConfig, Endpoint};
 use http::{Method, Request, StatusCode};
-use quinn::crypto::rustls::QuicClientConfig;
+use quinn::{crypto::rustls::QuicClientConfig, TransportConfig};
 use std::{collections::HashMap, fs, path::PathBuf, sync::Arc};
 use tokio::net::lookup_host;
 use tracing::debug;
@@ -29,17 +29,32 @@ pub struct SseEvent {
     pub id: Option<String>,
 }
 
-impl H3Client {
-    pub async fn new(
-        server_name: &str,
-        server_port: u16,
-        ca_path: PathBuf,
-        tls_server_name: Option<&str>,
-    ) -> Result<Self> {
-        // Install default crypto provider (if needed)
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+pub struct H3Connector {
+    inner: Arc<Endpoint>,
+}
 
-        // Load CA certificate
+impl H3Connector {
+    pub fn new(ca_path: PathBuf) -> Result<Self> {
+        Self::with_transport_config(ca_path, None)
+    }
+
+    pub fn with_transport_config(
+        ca_path: PathBuf,
+        transport_config: Option<Arc<TransportConfig>>
+    ) -> Result<Self> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let client_config = Self::build_client_config(ca_path, transport_config)?;
+        let mut endpoint = Endpoint::client("[::]:0".parse()?)?;
+        endpoint.set_default_client_config(client_config);
+        Ok(Self {
+            inner: Arc::new(endpoint),
+        })
+    }
+
+    fn build_client_config(
+        ca_path: PathBuf,
+        transport_config: Option<Arc<TransportConfig>>,
+    ) -> Result<ClientConfig> {
         let ca_cert_data = fs::read(ca_path).context("Failed to read CA certificate")?;
 
         let ca_certs = rustls_pemfile::certs(&mut ca_cert_data.as_slice())
@@ -53,23 +68,40 @@ impl H3Client {
                 .context("Failed to add CA certificate to store")?;
         }
 
-        // Create TLS config with the CA certificate
         let mut tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
-
-        // Set ALPN protocols for HTTP/3
         tls_config.alpn_protocols = vec![b"h3".to_vec()];
 
-        let client_config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls_config)?));
+        let mut client_config =
+            ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls_config)?));
+        if let Some(tc) = transport_config {
+            client_config.transport_config(tc);
+        }
+        Ok(client_config)
+    }
+}
 
-        // Create Quinn endpoint
-        let mut endpoint = Endpoint::client("[::]:0".parse()?)?;
-        endpoint.set_default_client_config(client_config);
+impl H3Client {
+    pub async fn new(
+        server_name: &str,
+        server_port: u16,
+        ca_path: PathBuf,
+        tls_server_name: Option<&str>,
+    ) -> Result<Self> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let endpoint = H3Connector::new(ca_path)?;
+        Self::connect(&endpoint, server_name, server_port, tls_server_name).await
+    }
 
+    pub async fn connect(
+        endpoint: &H3Connector,
+        server_name: &str,
+        server_port: u16,
+        tls_server_name: Option<&str>,
+    ) -> Result<Self> {
         let server = format!("{}:{}", server_name, server_port);
 
-        // Use DNS resolution to get the socket address (IPv4 only)
         let server_addr = lookup_host(&server)
             .await
             .context(format!("Failed to resolve server address: {server}"))?
@@ -78,18 +110,16 @@ impl H3Client {
 
         debug!("Connecting to {}...", server_addr);
 
-        // Use tls_server_name or server_name for validation
         let validation_name = tls_server_name.unwrap_or(server_name);
 
-        // Connect to server using validation
         let quinn_conn = endpoint
+            .inner
             .connect(server_addr, validation_name)?
             .await
             .context("Failed to establish QUIC connection")?;
 
         debug!("QUIC connection established");
 
-        // Create H3 connection
         let (h3_conn, h3_send_request) =
             h3::client::new(h3_quinn::Connection::new(quinn_conn)).await?;
 
