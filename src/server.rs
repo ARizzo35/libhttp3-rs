@@ -102,7 +102,7 @@ async fn handle_connection(
         match h3_conn.accept().await {
             Ok(Some(resolver)) => {
                 let app = app.clone();
-                tracing::info!("Handling request");
+                tracing::debug!("Handling request");
                 tokio::spawn(async move {
                     if let Err(e) = handle_request(resolver, app).await {
                         tracing::error!("Request error: {}", e);
