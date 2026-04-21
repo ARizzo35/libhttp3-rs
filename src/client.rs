@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use bytes::{Buf, Bytes};
 use h3_quinn::quinn::{ClientConfig, Endpoint};
-use http::{Method, Request, StatusCode};
+use http::{HeaderMap, Method, Request, StatusCode};
 use quinn::crypto::rustls::QuicClientConfig;
-use std::{collections::HashMap, fs, path::PathBuf, sync::Arc};
+use std::{fs, path::PathBuf, sync::Arc};
 use tokio::net::lookup_host;
 use tracing::debug;
 
@@ -18,7 +18,7 @@ pub struct H3Client {
 #[derive(Debug)]
 pub struct H3Response {
     pub status: StatusCode,
-    pub headers: HashMap<String, String>,
+    pub headers: HeaderMap,
     pub body: Bytes,
 }
 
@@ -188,10 +188,7 @@ impl H3Client {
             status.canonical_reason().unwrap_or("")
         );
 
-        let mut headers = HashMap::new();
-        for (name, value) in response.headers() {
-            headers.insert(name.to_string(), value.to_str().unwrap_or("").to_string());
-        }
+        let headers = response.headers().clone();
 
         let mut body_data = Vec::new();
         while let Some(chunk) = request_stream.recv_data().await? {
@@ -235,17 +232,9 @@ impl H3Client {
             ));
         }
 
-        let encoding = response
-            .headers()
-            .iter()
-            .find(|(name, _)| name.as_str().eq_ignore_ascii_case("content-encoding"))
-            .map(|(_, value)| value.to_str().unwrap_or("").to_string());
+        let headers = response.headers().clone();
 
-        if let Some(ref enc) = encoding {
-            debug!("SSE stream has Content-Encoding: {}", enc);
-        }
-
-        Ok(SseStream::new(request_stream, encoding))
+        Ok(SseStream::new(request_stream, headers))
     }
 }
 
@@ -253,7 +242,7 @@ pub struct SseStream {
     request_stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     buffer: Vec<u8>,
     current_event: SseEventBuilder,
-    encoding: Option<String>,
+    headers: HeaderMap,
 }
 
 #[derive(Default)]
@@ -297,13 +286,13 @@ impl SseEventBuilder {
 impl SseStream {
     fn new(
         request_stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-        encoding: Option<String>,
+        headers: HeaderMap,
     ) -> Self {
         Self {
             request_stream,
             buffer: Vec::new(),
             current_event: SseEventBuilder::default(),
-            encoding,
+            headers,
         }
     }
 
@@ -339,12 +328,8 @@ impl SseStream {
         }
     }
 
-    pub fn is_compressed(&self) -> bool {
-        self.encoding.is_some()
-    }
-
-    pub fn encoding(&self) -> Option<&str> {
-        self.encoding.as_deref()
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
     }
 
     pub async fn next_raw_chunk(&mut self) -> Result<Option<Bytes>> {
