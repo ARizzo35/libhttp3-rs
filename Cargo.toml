@@ -1,6 +1,6 @@
 [package]
 name = "libhttp3"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "A Rust library for HTTP/3 clients and servers."
 readme = "README.md"
