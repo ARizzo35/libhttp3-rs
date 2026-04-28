@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use bytes::{Buf, Bytes};
 use h3_quinn::quinn::{ClientConfig, Endpoint};
-use http::{HeaderMap, Method, Request, StatusCode};
+use http::{
+    HeaderMap, Method, Request, StatusCode,
+    header::{ACCEPT, CACHE_CONTROL, CONTENT_TYPE, HOST},
+};
 use quinn::crypto::rustls::QuicClientConfig;
 use std::{fs, path::PathBuf, sync::Arc};
 use tokio::net::lookup_host;
@@ -13,6 +16,7 @@ pub struct H3Client {
     h3_conn: Arc<h3::client::Connection<h3_quinn::Connection, Bytes>>,
     h3_send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
     server_host: String,
+    default_headers: HeaderMap,
 }
 
 #[derive(Debug)]
@@ -99,7 +103,24 @@ impl H3Client {
             h3_conn: Arc::new(h3_conn),
             h3_send_request,
             server_host: server.clone(),
+            default_headers: HeaderMap::new(),
         })
+    }
+
+    pub fn set_default_headers(&mut self, headers: HeaderMap) -> Result<()> {
+        for name in [HOST, CONTENT_TYPE, ACCEPT, CACHE_CONTROL] {
+            if headers.contains_key(&name) {
+                return Err(anyhow::anyhow!(
+                    "header {name} is reserved by the client and cannot be set"
+                ));
+            }
+        }
+        self.default_headers = headers;
+        Ok(())
+    }
+
+    pub fn clear_default_headers(&mut self) {
+        self.default_headers.clear();
     }
 
     pub async fn delete(&mut self, path: &str) -> Result<H3Response> {
@@ -115,11 +136,14 @@ impl H3Client {
     }
 
     pub async fn get_binary_stream(&mut self, path: &str) -> Result<BinaryStream> {
-        let req = Request::builder()
+        let mut req_builder = Request::builder()
             .method(Method::GET)
             .uri(path)
-            .header("Host", &self.server_host)
-            .body(())?;
+            .header("Host", &self.server_host);
+        for (name, value) in self.default_headers.iter() {
+            req_builder = req_builder.header(name, value);
+        }
+        let req = req_builder.body(())?;
 
         debug!("Starting binary stream for {}", path);
 
@@ -166,6 +190,10 @@ impl H3Client {
             req_builder = req_builder.header("Content-Type", "application/json");
         }
 
+        for (name, value) in self.default_headers.iter() {
+            req_builder = req_builder.header(name, value);
+        }
+
         let req = req_builder.body(())?;
 
         debug!("Sending {} request to {}", req.method(), path);
@@ -203,13 +231,16 @@ impl H3Client {
     }
 
     async fn sse_stream(&mut self, path: &str) -> Result<SseStream> {
-        let req = Request::builder()
+        let mut req_builder = Request::builder()
             .method(Method::GET)
             .uri(path)
             .header("Host", &self.server_host)
             .header("Accept", "text/event-stream")
-            .header("Cache-Control", "no-cache")
-            .body(())?;
+            .header("Cache-Control", "no-cache");
+        for (name, value) in self.default_headers.iter() {
+            req_builder = req_builder.header(name, value);
+        }
+        let req = req_builder.body(())?;
 
         debug!("Starting SSE stream for {}", path);
 
