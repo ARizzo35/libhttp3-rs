@@ -6,12 +6,25 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::broadcast;
+
+/// The sending half of a close signal for [`http3_serve`].
+pub type CloseHandle = broadcast::Sender<()>;
+
+/// The receiving half, passed into [`http3_serve`].
+pub type CloseSignal = broadcast::Receiver<()>;
+
+/// Create a linked [`CloseHandle`]/[`CloseSignal`] pair for [`http3_serve`].
+pub fn close_signal() -> (CloseHandle, CloseSignal) {
+    broadcast::channel(1)
+}
 
 pub async fn http3_serve(
     router: Router,
     addr: SocketAddr,
     certpath: PathBuf,
     keypath: PathBuf,
+    close_signal: Option<CloseSignal>,
 ) -> Result<()> {
     // Install default crypto provider
     rustls::crypto::aws_lc_rs::default_provider()
@@ -64,8 +77,9 @@ pub async fn http3_serve(
     while let Some(incoming) = endpoint.accept().await {
         let remote_addr = incoming.remote_address();
         let router = router.clone();
+        let conn_close_signal = close_signal.as_ref().map(CloseSignal::resubscribe);
         tokio::spawn(async move {
-            match handle_connection(incoming, router).await {
+            match handle_connection(incoming, router, conn_close_signal).await {
                 Ok(()) => tracing::info!("HTTP/3 connection from {} closed", remote_addr),
                 Err(e) => tracing::error!("HTTP/3 connection from {} failed: {}", remote_addr, e),
             }
@@ -78,6 +92,7 @@ pub async fn http3_serve(
 async fn handle_connection(
     incoming: quinn::Incoming,
     app: Router,
+    mut close_signal: Option<CloseSignal>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let conn = incoming
         .await
@@ -91,35 +106,60 @@ async fn handle_connection(
     // You can configure H3 protocol settings directly here:
     //   .max_field_section_size(8192) - header size limits
     //   .send_grease(true) - GREASE for compatibility testing
+    //
+    // `conn` is cloned so a copy survives independently of the one moved
+    // into the h3 connection, for `close_all` to close later.
     let h3_conn = h3::server::builder()
-        .build(h3_quinn::Connection::new(conn))
+        .build(h3_quinn::Connection::new(conn.clone()))
         .await?;
 
     tokio::pin!(h3_conn);
 
     // Accept H3 requests (standard h3 API)
     loop {
-        match h3_conn.accept().await {
-            Ok(Some(resolver)) => {
-                let app = app.clone();
-                tracing::debug!("Handling request");
-                tokio::spawn(async move {
-                    if let Err(e) = handle_request(resolver, app).await {
-                        tracing::error!("Request error: {}", e);
+        // Handle Lagged and Closed errors.
+        let closed = async {
+            match close_signal.as_mut() {
+                Some(rx) => loop {
+                    match rx.recv().await {
+                        Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => return,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            std::future::pending::<()>().await
+                        }
                     }
-                });
+                },
+                None => std::future::pending::<()>().await,
             }
-            Ok(None) => {
-                tracing::info!("Connection closed by peer: {}", remote_addr);
-                break;
-            }
-            Err(e) => {
-                // h3-axum helper: distinguish graceful closes from errors
-                if h3_axum::is_graceful_h3_close(&e) {
-                    tracing::debug!("Connection closed gracefully: {}", remote_addr);
-                } else {
-                    tracing::error!("H3 connection error: {:?}", e);
+        };
+
+        tokio::select! {
+            result = h3_conn.accept() => match result {
+                Ok(Some(resolver)) => {
+                    let app = app.clone();
+                    tracing::debug!("Handling request");
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_request(resolver, app).await {
+                            tracing::error!("Request error: {}", e);
+                        }
+                    });
                 }
+                Ok(None) => {
+                    tracing::info!("Connection closed by peer: {}", remote_addr);
+                    break;
+                }
+                Err(e) => {
+                    // h3-axum helper: distinguish graceful closes from errors
+                    if h3_axum::is_graceful_h3_close(&e) {
+                        tracing::debug!("Connection closed gracefully: {}", remote_addr);
+                    } else {
+                        tracing::error!("H3 connection error: {:?}", e);
+                    }
+                    break;
+                }
+            },
+            _ = closed => {
+                tracing::info!("closing HTTP/3 connection from {} on external signal", remote_addr);
+                conn.close(0u32.into(), b"");
                 break;
             }
         }
