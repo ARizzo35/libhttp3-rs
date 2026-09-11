@@ -26,10 +26,14 @@ pub async fn http3_serve(
     keypath: PathBuf,
     close_signal: Option<CloseSignal>,
 ) -> Result<()> {
-    // Install default crypto provider
-    rustls::crypto::aws_lc_rs::default_provider()
+    // Install the default crypto provider. The only way this fails is if a
+    // provider is already installed.
+    if rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
-        .expect("Failed to install crypto provider");
+        .is_err()
+    {
+        tracing::debug!("crypto provider already installed; reusing the existing one");
+    }
 
     // Load certificate and private key from files
     let cert_pem = fs::read_to_string(certpath)?;
