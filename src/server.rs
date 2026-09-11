@@ -178,3 +178,192 @@ async fn handle_request(
 ) -> Result<(), h3_axum::BoxError> {
     h3_axum::serve_h3_with_axum(app, resolver).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{CloseSignal, close_signal, http3_serve};
+    use crate::client::H3Client;
+    use axum::Router;
+    use axum::routing::get;
+    use http::StatusCode;
+    use std::net::{SocketAddr, UdpSocket};
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    fn reserve_port() -> SocketAddr {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("reserve udp port");
+        let addr = socket.local_addr().expect("local addr");
+        drop(socket);
+        addr
+    }
+
+    fn cert_paths() -> (PathBuf, PathBuf, PathBuf) {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/certs");
+        (
+            base.join("server.crt"),
+            base.join("server.key"),
+            base.join("ca.crt"),
+        )
+    }
+
+    fn test_router() -> Router {
+        Router::new().route("/", get(|| async { "hi" }))
+    }
+
+    /// Spawns `http3_serve` on a freshly reserved port and gives the QUIC
+    /// endpoint time to bind before returning.
+    async fn spawn_server(close_signal: Option<CloseSignal>) -> SocketAddr {
+        let addr = reserve_port();
+        let (cert, key, _ca) = cert_paths();
+        tokio::spawn(http3_serve(test_router(), addr, cert, key, close_signal));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        addr
+    }
+
+    /// Connects an `H3Client`, retrying while the freshly spawned server
+    /// finishes binding its UDP socket.
+    async fn connect(addr: SocketAddr) -> H3Client {
+        let (_, _, ca) = cert_paths();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match H3Client::new("localhost", addr.port(), ca.clone(), None).await {
+                Ok(client) => return client,
+                Err(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(e) => panic!("connect h3 client: {e:#}"),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn signal_closes_the_connection() {
+        let (handle, signal) = close_signal();
+        let addr = spawn_server(Some(signal)).await;
+        let mut client = connect(addr).await;
+
+        let resp = client.get("/").await.expect("first request should succeed");
+        assert_eq!(resp.status, StatusCode::OK);
+
+        handle.send(()).expect("send close signal");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        client
+            .get("/")
+            .await
+            .expect_err("connection should be closed after the signal");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn none_behaves_like_no_signal_at_all() {
+        let addr = spawn_server(None).await;
+        let mut client = connect(addr).await;
+
+        let resp = client
+            .get("/")
+            .await
+            .expect("a request should succeed with no close signal configured");
+        assert_eq!(resp.status, StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_connections_are_unaffected_by_a_past_signal() {
+        let (handle, signal) = close_signal();
+        let addr = spawn_server(Some(signal)).await;
+
+        let mut client1 = connect(addr).await;
+        client1
+            .get("/")
+            .await
+            .expect("first connection should work");
+
+        handle.send(()).expect("send close signal");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client1
+            .get("/")
+            .await
+            .expect_err("the old connection should be closed");
+
+        let mut client2 = connect(addr).await;
+        let resp = client2
+            .get("/")
+            .await
+            .expect("a fresh connection opened after the signal should still work");
+        assert_eq!(resp.status, StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_signal_closes_every_open_connection() {
+        let (handle, signal) = close_signal();
+        let addr = spawn_server(Some(signal)).await;
+
+        let mut client_a = connect(addr).await;
+        let mut client_b = connect(addr).await;
+        client_a.get("/").await.expect("client a's first request");
+        client_b.get("/").await.expect("client b's first request");
+
+        handle.send(()).expect("send close signal");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        client_a
+            .get("/")
+            .await
+            .expect_err("client a should be closed");
+        client_b
+            .get("/")
+            .await
+            .expect_err("client b should be closed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_signal_is_repeatable_across_multiple_fires() {
+        let (handle, signal) = close_signal();
+        let addr = spawn_server(Some(signal)).await;
+
+        let mut client1 = connect(addr).await;
+        client1
+            .get("/")
+            .await
+            .expect("first connection should work");
+        handle.send(()).expect("first close");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client1
+            .get("/")
+            .await
+            .expect_err("first connection should be closed");
+
+        let mut client2 = connect(addr).await;
+        client2
+            .get("/")
+            .await
+            .expect("second connection should work");
+        handle.send(()).expect("second close");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client2
+            .get("/")
+            .await
+            .expect_err("a later signal should also close a later connection");
+    }
+
+    // Single-threaded on purpose, to guarantee ordering.
+    #[tokio::test]
+    async fn a_lagged_receive_is_still_treated_as_fired() {
+        let (handle, signal) = close_signal();
+        let addr = spawn_server(Some(signal)).await;
+        let mut client = connect(addr).await;
+        client
+            .get("/")
+            .await
+            .expect("connection should be healthy before the lag test");
+
+        handle.send(()).expect("first send");
+        handle.send(()).expect("second send");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client
+            .get("/")
+            .await
+            .expect_err("a lagged receive should still close the connection");
+    }
+}
