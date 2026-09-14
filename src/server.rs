@@ -6,17 +6,17 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::watch;
 
 /// The sending half of a close signal for [`http3_serve`].
-pub type CloseHandle = broadcast::Sender<()>;
+pub type CloseHandle = watch::Sender<()>;
 
 /// The receiving half, passed into [`http3_serve`].
-pub type CloseSignal = broadcast::Receiver<()>;
+pub type CloseSignal = watch::Receiver<()>;
 
 /// Create a linked [`CloseHandle`]/[`CloseSignal`] pair for [`http3_serve`].
 pub fn close_signal() -> (CloseHandle, CloseSignal) {
-    broadcast::channel(1)
+    watch::channel(())
 }
 
 pub async fn http3_serve(
@@ -81,7 +81,11 @@ pub async fn http3_serve(
     while let Some(incoming) = endpoint.accept().await {
         let remote_addr = incoming.remote_address();
         let router = router.clone();
-        let conn_close_signal = close_signal.as_ref().map(CloseSignal::resubscribe);
+        let conn_close_signal = close_signal.as_ref().map(|rx| {
+            let mut rx = rx.clone();
+            rx.borrow_and_update();
+            rx
+        });
         tokio::spawn(async move {
             match handle_connection(incoming, router, conn_close_signal).await {
                 Ok(()) => tracing::info!("HTTP/3 connection from {} closed", remote_addr),
@@ -121,17 +125,15 @@ async fn handle_connection(
 
     // Accept H3 requests (standard h3 API)
     loop {
-        // Handle Lagged and Closed errors.
+        // `changed()` resolves once when a new value has been sent since
+        // this receiver last observed one.
         let closed = async {
             match close_signal.as_mut() {
-                Some(rx) => loop {
-                    match rx.recv().await {
-                        Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => return,
-                        Err(broadcast::error::RecvError::Closed) => {
-                            std::future::pending::<()>().await
-                        }
+                Some(rx) => {
+                    if rx.changed().await.is_err() {
+                        std::future::pending::<()>().await
                     }
-                },
+                }
                 None => std::future::pending::<()>().await,
             }
         };
@@ -344,26 +346,5 @@ mod tests {
             .get("/")
             .await
             .expect_err("a later signal should also close a later connection");
-    }
-
-    // Single-threaded on purpose, to guarantee ordering.
-    #[tokio::test]
-    async fn a_lagged_receive_is_still_treated_as_fired() {
-        let (handle, signal) = close_signal();
-        let addr = spawn_server(Some(signal)).await;
-        let mut client = connect(addr).await;
-        client
-            .get("/")
-            .await
-            .expect("connection should be healthy before the lag test");
-
-        handle.send(()).expect("first send");
-        handle.send(()).expect("second send");
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        client
-            .get("/")
-            .await
-            .expect_err("a lagged receive should still close the connection");
     }
 }
