@@ -31,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
         addr,
         concat!(env!("CARGO_MANIFEST_DIR"), "/examples/certs/server.crt").into(),
         concat!(env!("CARGO_MANIFEST_DIR"), "/examples/certs/server.key").into(),
+        None,
     )
     .await
 }
