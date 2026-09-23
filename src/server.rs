@@ -74,7 +74,8 @@ pub async fn http3_serve(
     transport_config
         .max_concurrent_bidi_streams(100_u32.into()) // Max concurrent HTTP requests
         .max_concurrent_uni_streams(100_u32.into()) // Max concurrent unidirectional streams
-        .max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into()?)); // Connection timeout
+        .max_idle_timeout(Some(crate::MAX_IDLE_TIMEOUT.try_into()?))
+        .keep_alive_interval(Some(crate::KEEP_ALIVE_INTERVAL));
 
     // Bind and listen
     let endpoint = quinn::Endpoint::server(server_config, addr)?;

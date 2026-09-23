@@ -65,7 +65,16 @@ impl H3Client {
         // Set ALPN protocols for HTTP/3
         tls_config.alpn_protocols = vec![b"h3".to_vec()];
 
-        let client_config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls_config)?));
+        let mut client_config =
+            ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls_config)?));
+
+        // Left unset, the client keeps quinn's 30 s default and that becomes the
+        // effective timeout for the connection.
+        let mut transport_config = quinn::TransportConfig::default();
+        transport_config
+            .max_idle_timeout(Some(crate::MAX_IDLE_TIMEOUT.try_into()?))
+            .keep_alive_interval(Some(crate::KEEP_ALIVE_INTERVAL));
+        client_config.transport_config(Arc::new(transport_config));
 
         // Create Quinn endpoint
         let mut endpoint = Endpoint::client("[::]:0".parse()?)?;
